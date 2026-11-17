@@ -1,0 +1,7 @@
+-r requirements-export.txt
+-r requirements-transfer.txt
+-r requirements-dataflow.txt
+langchain-classic>=1.0
+langchain-core>=1.0
+langchain-nvidia-ai-endpoints
+google-cloud-storage>=2.18
