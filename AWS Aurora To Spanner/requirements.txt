@@ -1,0 +1,5 @@
+google-auth>=2.35
+google-cloud-spanner>=3.50
+langchain-nvidia-ai-endpoints
+mysql-connector-python>=9.0
+python-dotenv>=1.0
