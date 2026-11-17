@@ -1,0 +1,62 @@
+# AWS Aurora MySQL to Cloud Spanner (Python + GitHub Actions)
+
+This kit uses six sequential GPT-6 Astra specialist agents, called through the OpenAI Responses API: source/target preflight, schema risk review, Spanner schema setup, Aurora export, Dataflow load, and validation. Every agent receives only one forced Python function tool. The Python controller decides stage order and stops on exceptions; GPT-6 Astra cannot invent successful results or run stages in parallel. The model ID is `gpt-6-astra`. No Java or Spanner Migration Tool is used.
+
+## Architecture
+
+```text
+GitHub Actions workflow_dispatch (requires typing MIGRATE)
+  -> self-hosted Linux runner inside the Aurora VPC
+  -> Python/PyMySQL streams rows in bounded gzip JSONL chunks to GCS
+  -> Python Apache Beam Dataflow workers batch writes with google-cloud-spanner
+  -> validation compares exported rows, committed writes, and dead letters
+```
+
+The Python Dataflow Spanner connector is custom: Google documents the managed Spanner Dataflow connector as part of the Beam Java SDK. This package instead uses the official Python Spanner client `Batch.insert_or_update` from Python Dataflow workers. Google documents this batch API here: [Python Spanner batching](https://docs.cloud.google.com/python/docs/reference/spanner/latest/batch-usage), [Dataflow Spanner connector language support](https://docs.cloud.google.com/spanner/docs/dataflow-connector).
+
+## 1. Prepare cloud access
+
+1. Create a Linux x64 self-hosted GitHub runner in a VPC/subnet that can reach the Aurora MySQL endpoint on port 3306. Add the `aurora-vpc` runner label. Allow outbound HTTPS to GitHub, OpenAI, Google APIs, and GCS.
+2. Create the Spanner instance and database. The migration service account needs permission to inspect the database, apply DDL if enabled, and write rows. The Dataflow worker service account needs Spanner database user access, plus GCS read/write and Dataflow worker permissions.
+3. Create a GCS bucket and enable Spanner, Dataflow, Cloud Storage, IAM Credentials, and Service Usage APIs.
+4. Configure Google Workload Identity Federation to trust this GitHub repository and allow impersonation of the GitHub migration service account. See the [Google GitHub Actions auth guide](https://github.com/google-github-actions/auth#workload-identity-federation).
+5. Ensure the Aurora source user can read all selected tables and `information_schema` metadata. Use a least-privilege account. TLS is enabled and the workflow downloads the AWS RDS CA bundle.
+
+## 2. Configure GitHub
+
+Add these **Actions secrets**:
+
+- `AURORA_HOST`
+- `AURORA_USER`
+- `AURORA_PASSWORD`
+- `OPENAI_API_KEY` (OpenAI API key with access to `gpt-6-astra`)
+
+Add these **Actions variables**:
+
+- `AURORA_DATABASE`
+- `GOOGLE_CLOUD_PROJECT`, `GCS_BUCKET`
+- `SPANNER_INSTANCE_ID`, `SPANNER_DATABASE_ID`
+- `DATAFLOW_REGION`, `DATAFLOW_TEMP_GCS`, `DATAFLOW_STAGING_GCS`, `DATAFLOW_WORKER_SERVICE_ACCOUNT`
+- `GCP_WORKLOAD_IDENTITY_PROVIDER` (full resource name), `GCP_MIGRATION_SERVICE_ACCOUNT` (email)
+
+Optional variables: `SPANNER_AUTO_CREATE_SCHEMA` (defaults to `true`), `AURORA_PORT` (3306), `DATAFLOW_NUM_WORKERS` (8), `DATAFLOW_MAX_WORKERS` (50), `DATAFLOW_MACHINE_TYPE` (`n2-standard-4`).
+
+Copy `.github/workflows/migrate.yml` and the Python files in this package to your repository. If you place the files elsewhere, adjust the workflow's `working-directory` and dependency path.
+
+## 3. Run the workflow
+
+1. Push the files to the repository's default branch.
+2. In GitHub, open **Actions -> Aurora MySQL to Spanner -> Run workflow**.
+3. Enter `MIGRATE` and start the workflow.
+4. Follow the sequential Astra agent logs. Review `GCS_PREFIX/ai-review.json` and `GCS_PREFIX/spanner-ddl.sql`. On completion, review `GCS_PREFIX/validation-report.json` and the Dataflow job in Google Cloud Console.
+
+For local runs, install `requirements.txt`, copy `.env.example` to `.env`, configure the same environment variables/Google ADC, then run `python agentic_migration.py`.
+
+## Type/schema behavior and limits
+
+- The schema agent can create missing Spanner tables using generated DDL when `SPANNER_AUTO_CREATE_SCHEMA=true`. Existing table columns are checked. The generator maps common numeric, string, bytes, date, timestamp, JSON, and boolean types. MySQL unsigned BIGINT and over-precision DECIMAL map to STRING to avoid overflow/precision loss.
+- Tables must have a primary key. Source table/column names must match `[A-Za-z_][A-Za-z0-9_]*`. Unsupported types fail before row export. Review generated DDL and metadata before production cutover.
+- The exporter uses a streaming cursor and bounded temporary gzip chunks; it does not save the entire data set locally. The export is not a globally consistent point-in-time snapshot across tables. Pause source writes during export/cutover or add a separate binlog-based change capture and reconciliation process. Aurora MySQL can export data to S3, but this package's loader format is generated by the Python exporter; AWS documents that export option [here](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.Integrating.SaveIntoS3.html).
+- Secondary indexes, foreign keys, triggers, stored procedures, auto-increment behavior, and application query changes are not migrated automatically. Plan target indexes and application changes separately.
+- The workflow job has a six-hour limit. A 1 TB source may exceed it, and the initial export is sequential per table. For longer migrations, use GitHub Actions to submit a long-running AWS Batch/ECS task or another persistent migration controller, then let that service run/resume the Python export and submit Dataflow.
+- Pilot representative tables and tune Dataflow/Spanner throughput before full migration. The validation stage stops if committed row counts differ from source export counts or if any non-empty dead-letter object exists.
