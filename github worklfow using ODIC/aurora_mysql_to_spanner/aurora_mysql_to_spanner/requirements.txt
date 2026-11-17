@@ -1,0 +1,8 @@
+apache-beam[gcp]>=2.67,<3
+google-cloud-spanner>=3.50
+google-cloud-storage>=2.18
+google-auth>=2.35
+pymysql>=1.1
+boto3>=1.35
+openai>=2.0
+python-dotenv>=1.0

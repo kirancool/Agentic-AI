@@ -7,19 +7,19 @@ The schema-review agent receives collection names, estimated document counts, an
 ## Architecture
 
 ```text
-GitHub Actions (OIDC to GCP)
+GitHub Actions (OIDC to AWS and GCP)
   -> self-hosted Linux runner in the DocumentDB VPC
   -> PyMongo reads DocumentDB in batches and uploads bounded gzip chunks to GCS
   -> Dataflow Python workers read those chunks and upsert Firestore documents
   -> sequential Astra stage agents call Python functions; Python checks counts and dead-letter output
 ```
 
-The runner must resolve and connect to the private DocumentDB cluster, and reach GitHub, GCS, and Google APIs. It needs enough local free disk for one compressed chunk (default 128 MiB, plus working space), not for the full export. Dataflow workers need access to the GCS paths and Firestore write permission. Amazon DocumentDB's documented Python TLS connection uses the AWS CA bundle, `replicaSet=rs0`, `readPreference=secondaryPreferred`, and `retryWrites=false`; put the matching connection options in `DOCDB_URI`. See [AWS DocumentDB Python connection guidance](https://docs.aws.amazon.com/documentdb/latest/devguide/connect_programmatically.html).
+The runner must resolve and connect to the private DocumentDB cluster, and reach GitHub, AWS STS, GCS, and Google APIs. It needs enough local free disk for one compressed chunk (default 128 MiB, plus working space), not for the full export. Dataflow workers need access to the GCS paths and Firestore write permission. The workflow uses GitHub OIDC to assume an AWS IAM role; PyMongo's `MONGODB-AWS` mechanism authenticates to DocumentDB using the resulting temporary credentials. No static AWS access keys or DocumentDB password are stored. This requires an instance-based Amazon DocumentDB 5.0 cluster with IAM authentication enabled. See [AWS DocumentDB IAM authentication](https://docs.aws.amazon.com/documentdb/latest/devguide/iam-identity-auth.html).
 
 ## 1. Prepare AWS and Google Cloud
 
 1. Create or select a Linux x64 GitHub self-hosted runner in the AWS VPC/subnets that can reach the DocumentDB cluster. Apply the custom runner label `docdb-vpc`. Configure security groups and routes so it can reach the DocumentDB endpoint on port 27017 and Google/GitHub endpoints over HTTPS.
-2. Downloading AWS's public DocumentDB CA bundle is done by the workflow into `/tmp/global-bundle.pem`. The connection URI should include `tls=true`, `replicaSet=rs0`, `readPreference=secondaryPreferred`, and `retryWrites=false`; ensure the username/password are URI-encoded.
+2. Enable IAM authentication for an instance-based DocumentDB 5.0 cluster and create a database principal in `$external` for the GitHub-assumed role ARN, granting only read access to the source database. AWS's example is `db.createUser({user: "arn:aws:iam::ACCOUNT:role/ROLE", mechanisms: ["MONGODB-AWS"], roles: [{role: "read", db: "YOUR_DATABASE"}]})`. The workflow downloads AWS's public DocumentDB CA bundle into `/tmp/global-bundle.pem` and configures TLS, `replicaSet=rs0`, `readPreference=secondaryPreferred`, `retryWrites=false`, and `authMechanism=MONGODB-AWS`.
 3. Create a GCS bucket, Firestore database, and Dataflow worker service account. Enable the Cloud Storage, Firestore, Dataflow, and IAM Credentials APIs. Grant the GitHub migration service account permissions to submit/monitor Dataflow jobs and access the bucket. Grant the Dataflow worker service account GCS read/write and Firestore write access.
 4. Configure Google Workload Identity Federation to trust this GitHub repository and allow the federated identity to impersonate the migration service account. Use Google's [GitHub Actions authentication guide](https://github.com/google-github-actions/auth#workload-identity-federation).
 
@@ -27,12 +27,12 @@ The runner must resolve and connect to the private DocumentDB cluster, and reach
 
 Add this **Actions secret**:
 
-- `DOCDB_URI`: e.g. `mongodb://USER:URL_ENCODED_PASSWORD@CLUSTER_ENDPOINT:27017/?tls=true&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false`
 - `OPENAI_API_KEY`: OpenAI API key with access to `gpt-6-astra`
 
 Add these **Actions variables** (Settings -> Secrets and variables -> Actions -> Variables):
 
 - `DOCDB_DATABASE`
+- `DOCDB_HOST`, `AWS_REGION`, and `AWS_ROLE_ARN` (the GitHub OIDC role ARN; it must match the `$external` DocumentDB principal)
 - `GOOGLE_CLOUD_PROJECT`
 - `GCS_BUCKET`
 - `GCP_WORKLOAD_IDENTITY_PROVIDER` (full provider resource name)
@@ -42,6 +42,8 @@ Add these **Actions variables** (Settings -> Secrets and variables -> Actions ->
 - `DATAFLOW_WORKER_SERVICE_ACCOUNT`
 
 Optional variables: `FIRESTORE_DATABASE` (defaults to `(default)`), `DATAFLOW_NUM_WORKERS`, `DATAFLOW_MAX_WORKERS`, `DATAFLOW_MACHINE_TYPE`, `FIRESTORE_RETRY_LIMIT`, `FIRESTORE_COLLECTION_PREFIX`, `MONGO_EXPORT_CHUNK_MB`, `MONGO_EXPORT_BATCH_SIZE`. The example values in the workflow are starting points; tune against observed throughput and quotas.
+
+The GitHub-assumed role ARN must match the principal configured in the DocumentDB `$external` database. Configure its AWS trust policy for GitHub's OIDC provider and restrict it to this repository and branch/environment. Local runs can use temporary AWS IAM Identity Center credentials or an attached role; PyMongo requires the `aws` extra (`pymongo[aws]`) for `MONGODB-AWS` authentication.
 
 Copy `.github/workflows/migrate.yml` into the repository's `.github/workflows/` directory, and copy this package's Python files and `requirements.txt` into `outputs/mongodb_to_firestore/` (or adjust the workflow paths). The workflow YAML is already in that directory for convenient review.
 

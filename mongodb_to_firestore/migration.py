@@ -22,13 +22,19 @@ def env(name: str, default: str | None = None) -> str:
 
 
 def mongo_client() -> MongoClient:
-    uri = env("DOCDB_URI")
-    ca_file = os.getenv("DOCDB_CA_FILE")
-    kwargs = {"serverSelectionTimeoutMS": 30000, "connectTimeoutMS": 30000}
-    if ca_file:
-        kwargs["tls"] = True
-        kwargs["tlsCAFile"] = ca_file
-    return MongoClient(uri, **kwargs)
+    host = env("DOCDB_HOST")
+    port = os.getenv("DOCDB_PORT", "27017")
+    ca_file = env("DOCDB_CA_FILE", "/tmp/global-bundle.pem")
+    auth_mode = os.getenv("DOCDB_AUTH_MODE", "iam").lower()
+    query = (
+        f"tls=true&tlsCAFile={ca_file}&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false"
+    )
+    if auth_mode == "iam":
+        query += "&authSource=%24external&authMechanism=MONGODB-AWS"
+    else:
+        raise ValueError("This workflow requires DOCDB_AUTH_MODE=iam; password-based DOCDB_URI auth is not configured")
+    uri = f"mongodb://{host}:{port}/?{query}"
+    return MongoClient(uri, serverSelectionTimeoutMS=30000, connectTimeoutMS=30000)
 
 
 def gcs_parts() -> tuple[storage.Client, str, str]:
