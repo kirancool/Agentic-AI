@@ -1,0 +1,83 @@
+name: DynamoDB to Firestore
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_migration:
+        description: Type MIGRATE to start a full snapshot migration
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: dynamodb-firestore-migration
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    if: ${{ inputs.confirm_migration == 'MIGRATE' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: gpt-6-astra
+      AWS_TRANSFER_CREDS_JSON: ${{ secrets.AWS_TRANSFER_CREDS_JSON }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      DDB_TABLE: ${{ vars.DDB_TABLE }}
+      DDB_EXPORT_BUCKET: ${{ vars.DDB_EXPORT_BUCKET }}
+      DDB_EXPORT_PREFIX: dynamodb-exports/${{ github.run_id }}-${{ github.run_attempt }}
+      AWS_TRANSFER_CREDENTIALS_FILE: aws-transfer-creds.json
+      GOOGLE_CLOUD_PROJECT: ${{ vars.GOOGLE_CLOUD_PROJECT }}
+      GCS_TRANSFER_BUCKET: ${{ vars.GCS_TRANSFER_BUCKET }}
+      GCS_TRANSFER_PREFIX: dynamodb-imports/${{ github.run_id }}-${{ github.run_attempt }}
+      DATAFLOW_REGION: ${{ vars.DATAFLOW_REGION }}
+      DATAFLOW_TEMP_GCS: ${{ vars.DATAFLOW_TEMP_GCS }}
+      DATAFLOW_STAGING_GCS: ${{ vars.DATAFLOW_STAGING_GCS }}
+      DATAFLOW_WORKER_SERVICE_ACCOUNT: ${{ vars.DATAFLOW_WORKER_SERVICE_ACCOUNT }}
+      DATAFLOW_NUM_WORKERS: ${{ vars.DATAFLOW_NUM_WORKERS }}
+      DATAFLOW_MAX_WORKERS: ${{ vars.DATAFLOW_MAX_WORKERS }}
+      DATAFLOW_MACHINE_TYPE: ${{ vars.DATAFLOW_MACHINE_TYPE }}
+      FIRESTORE_DATABASE: ${{ vars.FIRESTORE_DATABASE }}
+      FIRESTORE_COLLECTION: ${{ vars.FIRESTORE_COLLECTION }}
+      DDB_DEAD_LETTER_GCS: gs://${{ vars.GCS_TRANSFER_BUCKET }}/dynamodb-imports/${{ github.run_id }}-${{ github.run_attempt }}/dlq
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: outputs/dynamodb_to_firestore/requirements-agentic.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r outputs/dynamodb_to_firestore/requirements-agentic.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: google-auth
+        name: Authenticate to Google Cloud with OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_MIGRATION_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Configure S3 source credentials for Storage Transfer Service
+        working-directory: outputs/dynamodb_to_firestore
+        env:
+          TRANSFER_CREDS_JSON: ${{ secrets.AWS_TRANSFER_CREDS_JSON }}
+        run: python -c "import os,pathlib; pathlib.Path('aws-transfer-creds.json').write_text(os.environ['TRANSFER_CREDS_JSON'], encoding='utf-8')"
+
+      - name: Run sequential GPT-6 Astra migration agents
+        working-directory: outputs/dynamodb_to_firestore
+        run: python agentic_migration.py --new-run
