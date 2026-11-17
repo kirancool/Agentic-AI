@@ -1,0 +1,72 @@
+name: Aurora MySQL to Spanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_migration:
+        description: Type MIGRATE to create schema and migrate a full source snapshot
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aurora-spanner-migration
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    if: ${{ inputs.confirm_migration == 'MIGRATE' }}
+    # This runner must be in a subnet/security group that can reach Aurora.
+    runs-on: [self-hosted, linux, x64, aurora-vpc]
+    timeout-minutes: 360
+    env:
+      AURORA_HOST: ${{ secrets.AURORA_HOST }}
+      AURORA_PORT: ${{ vars.AURORA_PORT || '3306' }}
+      AURORA_DATABASE: ${{ vars.AURORA_DATABASE }}
+      AURORA_USER: ${{ secrets.AURORA_USER }}
+      AURORA_PASSWORD: ${{ secrets.AURORA_PASSWORD }}
+      AURORA_SSL: 'true'
+      AURORA_SSL_CA: /tmp/aws-rds-global-bundle.pem
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: gpt-6-astra
+      GOOGLE_CLOUD_PROJECT: ${{ vars.GOOGLE_CLOUD_PROJECT }}
+      GCS_BUCKET: ${{ vars.GCS_BUCKET }}
+      GCS_PREFIX: aurora-spanner/${{ github.run_id }}-${{ github.run_attempt }}
+      SPANNER_INSTANCE_ID: ${{ vars.SPANNER_INSTANCE_ID }}
+      SPANNER_DATABASE_ID: ${{ vars.SPANNER_DATABASE_ID }}
+      SPANNER_AUTO_CREATE_SCHEMA: ${{ vars.SPANNER_AUTO_CREATE_SCHEMA || 'true' }}
+      DATAFLOW_REGION: ${{ vars.DATAFLOW_REGION }}
+      DATAFLOW_TEMP_GCS: ${{ vars.DATAFLOW_TEMP_GCS }}
+      DATAFLOW_STAGING_GCS: ${{ vars.DATAFLOW_STAGING_GCS }}
+      DATAFLOW_WORKER_SERVICE_ACCOUNT: ${{ vars.DATAFLOW_WORKER_SERVICE_ACCOUNT }}
+      DATAFLOW_NUM_WORKERS: ${{ vars.DATAFLOW_NUM_WORKERS || '8' }}
+      DATAFLOW_MAX_WORKERS: ${{ vars.DATAFLOW_MAX_WORKERS || '50' }}
+      DATAFLOW_MACHINE_TYPE: ${{ vars.DATAFLOW_MACHINE_TYPE || 'n2-standard-4' }}
+      SPANNER_DEAD_LETTER_PREFIX: gs://${{ vars.GCS_BUCKET }}/aurora-spanner/${{ github.run_id }}-${{ github.run_attempt }}/dead-letter
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: outputs/aurora_mysql_to_spanner/requirements.txt
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r outputs/aurora_mysql_to_spanner/requirements.txt
+      - name: Download AWS RDS CA bundle
+        run: curl --fail --silent --show-error https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem --output /tmp/aws-rds-global-bundle.pem
+      - id: google-auth
+        name: Authenticate to Google Cloud with OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_MIGRATION_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
+      - name: Run sequential GPT-6 Astra migration agents
+        working-directory: outputs/aurora_mysql_to_spanner
+        run: python agentic_migration.py
