@@ -1,8 +1,8 @@
 # Amazon DocumentDB to Cloud Firestore (Python + GitHub Actions)
 
-This kit uses a manually triggered GitHub Actions workflow to run five ordered Python stages: preflight, a GPT-6 Astra metadata review, DocumentDB export to compressed JSONL files in GCS, a Python Apache Beam/Dataflow load into Firestore, and count/dead-letter validation. The model ID is `gpt-6-astra`, called through the OpenAI Responses API. No Java is used. The workflow is deliberately manual because it writes to the destination; starting it requires typing `MIGRATE`.
+This kit uses a manually triggered GitHub Actions workflow to run five sequential GPT-6 Astra specialist agents through the OpenAI Responses API: preflight, schema review, DocumentDB export, Dataflow load, and validation. Each agent gets one stage-specific Python function tool. The controller forces that tool call, runs the deterministic Python stage, and starts the next agent only after success. Parallel stage calls are disabled. The model ID is `gpt-6-astra`. No Java is used. The workflow is deliberately manual because it writes to the destination; starting it requires typing `MIGRATE`.
 
-The Astra review receives collection names, estimated document counts, and index metadata only. It does not receive document values, control the migration, or modify records. Its report is saved to `GCS_PREFIX/ai-review.json`; data operations remain deterministic Python code.
+The schema-review agent receives collection names, estimated document counts, and index metadata only. It does not receive document values or modify records. Its report is saved to `GCS_PREFIX/ai-review.json`. Agents coordinate and report the stages; the Python controller enforces order, stops on errors, and handles all data operations.
 
 ## Architecture
 
@@ -11,7 +11,7 @@ GitHub Actions (OIDC to GCP)
   -> self-hosted Linux runner in the DocumentDB VPC
   -> PyMongo reads DocumentDB in batches and uploads bounded gzip chunks to GCS
   -> Dataflow Python workers read those chunks and upsert Firestore documents
-  -> workflow checks source/export/write counts and dead-letter output
+  -> sequential Astra stage agents call Python functions; Python checks counts and dead-letter output
 ```
 
 The runner must resolve and connect to the private DocumentDB cluster, and reach GitHub, GCS, and Google APIs. It needs enough local free disk for one compressed chunk (default 128 MiB, plus working space), not for the full export. Dataflow workers need access to the GCS paths and Firestore write permission. Amazon DocumentDB's documented Python TLS connection uses the AWS CA bundle, `replicaSet=rs0`, `readPreference=secondaryPreferred`, and `retryWrites=false`; put the matching connection options in `DOCDB_URI`. See [AWS DocumentDB Python connection guidance](https://docs.aws.amazon.com/documentdb/latest/devguide/connect_programmatically.html).
@@ -76,4 +76,4 @@ python migration.py load
 python migration.py validate
 ```
 
-The Actions workflow runs those commands sequentially and stops at the first failure.
+The GitHub Actions workflow runs `python agentic_migration.py`; that script runs the five Astra agents sequentially and stops at the first failed Python stage.
