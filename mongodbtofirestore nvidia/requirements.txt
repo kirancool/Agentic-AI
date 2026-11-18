@@ -1,0 +1,7 @@
+apache-beam[gcp]>=2.67,<3
+google-cloud-firestore>=2.20
+google-cloud-storage>=2.18
+google-auth>=2.35
+pymongo[aws]>=4.10
+python-dotenv>=1.0
+openai>=2.0
