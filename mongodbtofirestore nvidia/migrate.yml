@@ -1,0 +1,86 @@
+name: Amazon DocumentDB to Firestore
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_migration:
+        description: Type MIGRATE to start a full snapshot migration
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: documentdb-firestore-migration
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    if: ${{ inputs.confirm_migration == 'MIGRATE' }}
+    # Register this self-hosted Linux runner in the AWS VPC that can reach DocumentDB.
+    runs-on: [self-hosted, linux, x64, docdb-vpc]
+    timeout-minutes: 360
+    env:
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      NVIDIA_MODEL: nvidia/nemotron-3-ultra-550b-a55b
+      NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
+      DOCDB_HOST: ${{ vars.DOCDB_HOST }}
+      DOCDB_PORT: ${{ vars.DOCDB_PORT || '27017' }}
+      DOCDB_AUTH_MODE: iam
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      DOCDB_DATABASE: ${{ vars.DOCDB_DATABASE }}
+      DOCDB_CA_FILE: /tmp/global-bundle.pem
+      GOOGLE_CLOUD_PROJECT: ${{ vars.GOOGLE_CLOUD_PROJECT }}
+      GCS_BUCKET: ${{ vars.GCS_BUCKET }}
+      GCS_PREFIX: mongo-firestore/${{ github.run_id }}-${{ github.run_attempt }}
+      FIRESTORE_DATABASE: ${{ vars.FIRESTORE_DATABASE || '(default)' }}
+      DATAFLOW_REGION: ${{ vars.DATAFLOW_REGION }}
+      DATAFLOW_TEMP_GCS: ${{ vars.DATAFLOW_TEMP_GCS }}
+      DATAFLOW_STAGING_GCS: ${{ vars.DATAFLOW_STAGING_GCS }}
+      DATAFLOW_WORKER_SERVICE_ACCOUNT: ${{ vars.DATAFLOW_WORKER_SERVICE_ACCOUNT }}
+      DATAFLOW_NUM_WORKERS: ${{ vars.DATAFLOW_NUM_WORKERS || '8' }}
+      DATAFLOW_MAX_WORKERS: ${{ vars.DATAFLOW_MAX_WORKERS || '50' }}
+      DATAFLOW_MACHINE_TYPE: ${{ vars.DATAFLOW_MACHINE_TYPE || 'n2-standard-4' }}
+      FIRESTORE_RETRY_LIMIT: ${{ vars.FIRESTORE_RETRY_LIMIT || '5' }}
+      FIRESTORE_DEAD_LETTER_PREFIX: gs://${{ vars.GCS_BUCKET }}/mongo-firestore/${{ github.run_id }}-${{ github.run_attempt }}/dead-letter
+      FIRESTORE_COLLECTION_PREFIX: ${{ vars.FIRESTORE_COLLECTION_PREFIX || 'migrated_' }}
+      MONGO_EXPORT_CHUNK_MB: ${{ vars.MONGO_EXPORT_CHUNK_MB || '128' }}
+      MONGO_EXPORT_BATCH_SIZE: ${{ vars.MONGO_EXPORT_BATCH_SIZE || '1000' }}
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: outputs/mongodb_to_firestore/requirements.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r outputs/mongodb_to_firestore/requirements.txt
+
+      - name: Install Amazon DocumentDB CA bundle
+        run: curl --fail --silent --show-error https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem --output /tmp/global-bundle.pem
+
+      - name: Configure temporary AWS role credentials for DocumentDB IAM authentication
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - id: google-auth
+        name: Authenticate to Google Cloud with OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_MIGRATION_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Run sequential Nemotron agents and Python migration tools
+        working-directory: outputs/mongodb_to_firestore
+        run: python agentic_migration.py
